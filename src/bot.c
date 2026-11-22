@@ -336,9 +336,16 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
                     rx = cx; ry = cy;
                 }
             }
-            double dl = dist2d(px, py, rx, ry) + 1e-6;
-            b->kite_dir[0] = (rx - px) / dl;
-            b->kite_dir[1] = (ry - py) / dl;
+            double dl = dist2d(px, py, rx, ry);
+            if (dl > 0.5) {
+                b->kite_dir[0] = (rx - px) / dl;
+                b->kite_dir[1] = (ry - py) / dl;
+            } else {
+                // Fallback: move toward next zone center
+                double zd = dist2d(px, py, z_nx, z_ny) + 1e-6;
+                b->kite_dir[0] = (z_nx - px) / zd;
+                b->kite_dir[1] = (z_ny - py) / zd;
+            }
         }
     }
     // End kite early if we healed and are clean for 5.2s
