@@ -108,6 +108,7 @@ bool map_load(WorldMap *m, const char *map_dir) {
     m->nav_ny = (int)(m->ny * m->step / m->nav_step);
     if (m->nav_nx > 0 && m->nav_ny > 0) {
         m->nav_blocked = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
+        m->nav_cover = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
         for (int iy = 0; iy < m->nav_ny; iy++) {
             double y = m->min_y + (iy + 0.5) * m->nav_step;
             for (int ix = 0; ix < m->nav_nx; ix++) {
@@ -116,6 +117,23 @@ bool map_load(WorldMap *m, const char *map_dir) {
                 if (map_blocked_at(m, x, y, z + 1.2, 7.5)) {
                     m->nav_blocked[iy * m->nav_nx + ix] = 1;
                 }
+            }
+        }
+        // Precompute O(1) cover score (0..8) = number of adjacent/nearby blocked directions
+        static const int cdx[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
+        static const int cdy[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
+        for (int iy = 2; iy < m->nav_ny - 2; iy++) {
+            for (int ix = 2; ix < m->nav_nx - 2; ix++) {
+                int idx = iy * m->nav_nx + ix;
+                if (m->nav_blocked[idx]) continue;
+                uint8_t cov = 0;
+                for (int k = 0; k < 8; k++) {
+                    if (m->nav_blocked[(iy + cdy[k]) * m->nav_nx + (ix + cdx[k])] ||
+                        m->nav_blocked[(iy + 2 * cdy[k]) * m->nav_nx + (ix + 2 * cdx[k])]) {
+                        cov++;
+                    }
+                }
+                m->nav_cover[idx] = cov;
             }
         }
     }
@@ -127,6 +145,7 @@ void map_free(WorldMap *m) {
     if (!m) return;
     free(m->terrain);
     free(m->nav_blocked);
+    free(m->nav_cover);
     for (int i = 0; i < m->n_prisms; i++) {
         free(m->prisms[i].ring.pts);
         for (int h = 0; h < m->prisms[i].n_holes; h++) {

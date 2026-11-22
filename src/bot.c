@@ -429,6 +429,15 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             double score = cos(ang - base_ang) * 10.0;
             if (map_blocked_at(&b->map, px + hx * 4.5, py + hy * 4.5, pz, 8.5)) {
                 score -= 100.0;
+            } else if (b->map.nav_cover) {
+                int cix = (int)((px + hx * 4.0 - b->map.min_x) / b->map.nav_step);
+                int ciy = (int)((py + hy * 4.0 - b->map.min_y) / b->map.nav_step);
+                if (cix >= 0 && ciy >= 0 && cix < b->map.nav_nx && ciy < b->map.nav_ny) {
+                    uint8_t cov = b->map.nav_cover[ciy * b->map.nav_nx + cix];
+                    bool reloading = (w_reload[0] > 0.0);
+                    double cov_w = (t < b->kite_until || reloading) ? 2.5 : (b->stance == STANCE_SQUAD ? 1.2 : 0.4);
+                    score += cov * cov_w;
+                }
             }
             // Penalize exposure to active threats (hug cover)
             double cx = px + hx * 4.0, cy = py + hy * 4.0;
