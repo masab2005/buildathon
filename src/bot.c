@@ -298,9 +298,9 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     if (best_threat_id >= 0) b->committed_target_id = best_threat_id;
     if (any_los) b->last_los_t = t;
 
-    // Trigger retreat when focus-fired at < 55% HP or critically low
-    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.45 : 0.36;
-    if (!zone_critical && ((engaged_count >= 2 && hp < max_hp * 0.55) || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
+    // Trigger retreat when focus-fired (2+ engaged at < 72% HP) or critically low
+    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.48 : 0.38;
+    if (!zone_critical && ((engaged_count >= 2 && hp < max_hp * 0.72) || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
         if (t > b->kite_until) {
             b->kite_until = t + 6.0;
             // Find a walkable cell that breaks LOS to all active threats
@@ -596,7 +596,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
 
         bool los = map_los_clear(&b->map, px, py, pz + muzzle_h, lx, ly, lz);
         double aim_err = fabs(wrap_angle(aim_yaw - cur_yaw));
-        double ang_size = atan2(2.8, fmax(d3, 5.0)) + 0.05;
+        double ang_size = atan2(2.8, fmax(d3, 5.0)) + 0.10;
         bool target_low = (best_threat_id >= 0 && b->threats[best_threat_id].hp < b->threats[best_threat_id].max_hp * 0.35);
 
         for (int s = 0; s < 2; s++) {
@@ -604,7 +604,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             if (strcmp(w_kind[s], "gun") == 0) {
                 // Kill-window discipline: don't poke > 150m with gun alone unless target is low
                 double max_gun_d = (w_kind[1] != NULL || target_low) ? w_range[s] : 150.0;
-                if (los && d3 < max_gun_d && aim_err < ang_size && w_cd[s] <= 0.0 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
+                if (los && d3 < max_gun_d && aim_err < ang_size && w_cd[s] <= 0.08 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
                     fire[s] = true;
                 }
             } else if (strcmp(w_kind[s], "laser") == 0) {
