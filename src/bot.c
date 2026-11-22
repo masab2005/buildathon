@@ -38,10 +38,13 @@ void bot_init(BotState *b, const JsonValue *hello) {
     b->last_damage_t = -100.0;
     b->last_los_t = -100.0;
     b->kite_until = -100.0;
+    b->committed_target_id = -1;
+    b->cached_wp_tick = -100;
 
     const JsonValue *map_obj = json_get(hello, "map");
     const char *map_dir = json_str(json_get(map_obj, "dir"), "/arena");
     map_load(&b->map, map_dir);
+    fprintf(stderr, "apex-mech: map loaded=%d prisms=%d\n", b->map.loaded, b->map.n_prisms);
 }
 
 void bot_free(BotState *b) {
@@ -259,53 +262,88 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         }
     }
 
-    // Evaluate active threats (5s memory)
+    // Evaluate active threats (5s memory) with advantage gate & target commitment
     int engaged_count = 0;
     bool enemy_charging = false;
     int best_threat_id = -1;
     double best_threat_score = 1e9;
     bool any_los = false;
+    double enemy_dps_on_us = 0.0;
 
     for (int id = 0; id < 16; id++) {
         ThreatMech *tm = &b->threats[id];
         if (!tm->active || t - tm->last_seen_t > 5.0) {
             tm->active = false;
+            if (b->committed_target_id == id) b->committed_target_id = -1;
             continue;
         }
         double d = dist2d(px, py, tm->pos[0], tm->pos[1]);
         double to_us = atan2(py - tm->pos[1], px - tm->pos[0]);
         bool aiming_at_us = fabs(wrap_angle(tm->aim[0] - to_us)) < 0.45;
         bool engaged = aiming_at_us || (t - tm->last_hit_us_t < 3.0);
-        if (engaged && d < 120.0) engaged_count++;
-        if (tm->charging && d < 220.0) enemy_charging = true;
-
         bool los = map_los_clear(&b->map, px, py, pz + muzzle_h, tm->pos[0], tm->pos[1], tm->pos[2] + 4.5);
         if (los) any_los = true;
+        if (engaged && d < 120.0) {
+            engaged_count++;
+            if (los) enemy_dps_on_us += (d < 45.0 && tm->has_lightning) ? 220.0 : 160.0;
+        }
+        if (tm->charging && d < 220.0) enemy_charging = true;
 
-        double score = d + (los ? 0.0 : 80.0) - (engaged ? 20.0 : 0.0);
+        double hp_frac = tm->hp / fmax(tm->max_hp, 1.0);
+        double score = d + hp_frac * 90.0 + (los ? 0.0 : 80.0) - (engaged ? 15.0 : 0.0);
+        if (id == b->committed_target_id) score -= 45.0; // Target commitment bonus
         if (score < best_threat_score) {
             best_threat_score = score;
             best_threat_id = id;
         }
     }
+    if (best_threat_id >= 0) b->committed_target_id = best_threat_id;
     if (any_los) b->last_los_t = t;
 
-    // Trigger 6s kite when focus-fired or low HP
-    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.52 : 0.42;
-    if (!zone_critical && (engaged_count >= 2 || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
+    double our_eff_dps = 185.0;
+    if (w_kind[1] && strcmp(w_kind[1], "lightning") == 0 && best_threat_id >= 0 &&
+        dist2d(px, py, b->threats[best_threat_id].pos[0], b->threats[best_threat_id].pos[1]) < 45.0) {
+        our_eff_dps += 180.0;
+    }
+    bool target_low = (best_threat_id >= 0 && b->threats[best_threat_id].hp < b->threats[best_threat_id].max_hp * 0.30);
+    bool bad_trade = (enemy_dps_on_us > 0.0 && our_eff_dps < enemy_dps_on_us * 1.15 && !target_low);
+
+    // Trigger LOS-breaking retreat + heal cycle when focus-fired, bad trade, or low HP
+    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.55 : 0.45;
+    if (!zone_critical && (engaged_count >= 2 || bad_trade || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
         if (t > b->kite_until) {
             b->kite_until = t + 6.0;
-            if (best_threat_id >= 0) {
-                double dx = px - b->threats[best_threat_id].pos[0];
-                double dy = py - b->threats[best_threat_id].pos[1];
-                double dl = hypot(dx, dy) + 1e-6;
-                b->kite_dir[0] = dx / dl;
-                b->kite_dir[1] = dy / dl;
-            } else {
-                b->kite_dir[0] = -cos(b->last_damage_bearing);
-                b->kite_dir[1] = -sin(b->last_damage_bearing);
+            // Find a walkable cell that breaks LOS to all active threats
+            double best_retreat_score = -1e9;
+            double rx = px, ry = py;
+            for (int k = 0; k < 16; k++) {
+                double ang = k * (2.0 * M_PI / 16.0);
+                double cx = px + 35.0 * cos(ang);
+                double cy = py + 35.0 * sin(ang);
+                if (dist2d(cx, cy, z_nx, z_ny) > z_nr * 0.95) continue;
+                double cz = map_terrain_height(&b->map, cx, cy);
+                if (map_blocked_at(&b->map, cx, cy, cz + 1.2, 7.5)) continue;
+                int visible_to = 0;
+                for (int id = 0; id < 16; id++) {
+                    if (!b->threats[id].active) continue;
+                    if (map_los_clear(&b->map, cx, cy, cz + 6.0, b->threats[id].pos[0], b->threats[id].pos[1], b->threats[id].pos[2] + 6.0)) {
+                        visible_to++;
+                    }
+                }
+                double sc = -visible_to * 100.0 - dist2d(cx, cy, z_nx, z_ny) * 0.1;
+                if (sc > best_retreat_score) {
+                    best_retreat_score = sc;
+                    rx = cx; ry = cy;
+                }
             }
+            double dl = dist2d(px, py, rx, ry) + 1e-6;
+            b->kite_dir[0] = (rx - px) / dl;
+            b->kite_dir[1] = (ry - py) / dl;
         }
+    }
+    // End kite early if we healed and are clean for 5.2s
+    if (t < b->kite_until && (t - b->last_damage_t >= 5.2) && hp >= max_hp * 0.78) {
+        b->kite_until = t;
     }
 
     // Choose desired movement goal
@@ -317,9 +355,13 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         double ang = atan2(z_ny - py, z_nx - px);
         double gx = z_nx - 0.6 * z_nr * cos(ang);
         double gy = z_ny - 0.6 * z_nr * sin(ang);
-        double d = dist2d(px, py, gx, gy) + 1e-6;
-        goal_vx = (gx - px) / d;
-        goal_vy = (gy - py) / d;
+        if (tick - b->cached_wp_tick >= 5) {
+            map_next_waypoint(&b->map, px, py, gx, gy, &b->cached_wp[0], &b->cached_wp[1]);
+            b->cached_wp_tick = tick;
+        }
+        double d = dist2d(px, py, b->cached_wp[0], b->cached_wp[1]) + 1e-6;
+        goal_vx = (b->cached_wp[0] - px) / d;
+        goal_vy = (b->cached_wp[1] - py) / d;
         if (zone_critical && energy > 25.0) boost = true;
     } else if (t < b->kite_until) {
         double zx = z_nx - px, zy = z_ny - py;
@@ -439,7 +481,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             double cz = json_num(json_arr_get(pp, 2), 0.0);
             if (dist2d(px, py, cx, cy) < 3.8 && fabs(pz - cz) < 3.8) {
                 const char *pk_kind = json_str(json_get(pk, "kind"), "");
-                if (!w_kind[0] || strcmp(pk_kind, w_kind[0]) != 0) {
+                if (strcmp(pk_kind, "mortar") != 0 && (!w_kind[0] || strcmp(pk_kind, w_kind[0]) != 0)) {
                     take_id = json_int(json_get(pk, "id"), -1);
                     break;
                 }
@@ -510,7 +552,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
                 }
             } else if (strcmp(w_kind[s], "mortar") == 0) {
                 double mpitch = 0.0;
-                if (d2 > 18.0 && d2 < 215.0 && solve_mortar_pitch(d2, (tz + 2.0) - (pz + 9.5), w_speed[s], 22.0, &mpitch)) {
+                if (!fire[0] && d2 > 18.0 && d2 < 215.0 && solve_mortar_pitch(d2, (tz + 2.0) - (pz + 9.5), w_speed[s], 22.0, &mpitch)) {
                     aim_pitch = mpitch;
                     if (aim_err < 0.15 && fabs(mpitch - cur_pitch) < 0.15) {
                         fire[s] = true;

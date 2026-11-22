@@ -54,6 +54,10 @@ typedef struct {
     double last_pos[3];
     int stuck_ticks;
     double scan_yaw;
+
+    int committed_target_id;
+    double cached_wp[2];
+    int cached_wp_tick;
 } BotState;
 
 void bot_init(BotState *b, const JsonValue *hello);

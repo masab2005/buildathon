@@ -27,6 +27,11 @@ typedef struct {
 
     Prism *prisms;
     int n_prisms;
+
+    // 4m navigation grid
+    int nav_nx, nav_ny;
+    double nav_step;
+    uint8_t *nav_blocked;
 } WorldMap;
 
 bool map_load(WorldMap *m, const char *map_dir);
@@ -36,5 +41,6 @@ double map_terrain_height(const WorldMap *m, double x, double y);
 bool map_point_in_prism(const Prism *p, double x, double y);
 bool map_blocked_at(const WorldMap *m, double x, double y, double z_feet, double height);
 bool map_los_clear(const WorldMap *m, double ax, double ay, double az, double bx, double by, double bz);
+bool map_next_waypoint(const WorldMap *m, double sx, double sy, double gx, double gy, double *wx, double *wy);
 
 #endif
