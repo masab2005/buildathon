@@ -102,8 +102,8 @@ bool map_load(WorldMap *m, const char *map_dir) {
 
     m->loaded = true;
 
-    // Build 4m navigation grid
-    m->nav_step = 4.0;
+    // Build 2m 3D navigation grid
+    m->nav_step = 2.0;
     m->nav_nx = (int)(m->nx * m->step / m->nav_step);
     m->nav_ny = (int)(m->ny * m->step / m->nav_step);
     if (m->nav_nx > 0 && m->nav_ny > 0) {
