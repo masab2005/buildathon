@@ -109,13 +109,23 @@ bool map_load(WorldMap *m, const char *map_dir) {
     if (m->nav_nx > 0 && m->nav_ny > 0) {
         m->nav_blocked = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
         m->nav_cover = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
+        m->nav_z = (float *)calloc((size_t)(m->nav_nx * m->nav_ny), sizeof(float));
         for (int iy = 0; iy < m->nav_ny; iy++) {
             double y = m->min_y + (iy + 0.5) * m->nav_step;
             for (int ix = 0; ix < m->nav_nx; ix++) {
                 double x = m->min_x + (ix + 0.5) * m->nav_step;
                 double z = map_terrain_height(m, x, y);
-                if (map_blocked_at(m, x, y, z + 1.2, 7.5)) {
-                    m->nav_blocked[iy * m->nav_nx + ix] = 1;
+                double surf_z = z;
+                for (int p = 0; p < m->n_prisms; p++) {
+                    const Prism *pr = &m->prisms[p];
+                    if (!pr->is_bridge && pr->top > surf_z && pr->top - z < 50.0 && map_point_in_prism(pr, x, y)) {
+                        surf_z = pr->top;
+                    }
+                }
+                int idx = iy * m->nav_nx + ix;
+                m->nav_z[idx] = (float)surf_z;
+                if (map_blocked_at(m, x, y, surf_z + 1.2, 7.5)) {
+                    m->nav_blocked[idx] = 1;
                 }
             }
         }
@@ -146,6 +156,7 @@ void map_free(WorldMap *m) {
     free(m->terrain);
     free(m->nav_blocked);
     free(m->nav_cover);
+    free(m->nav_z);
     for (int i = 0; i < m->n_prisms; i++) {
         free(m->prisms[i].ring.pts);
         for (int h = 0; h < m->prisms[i].n_holes; h++) {
@@ -341,7 +352,9 @@ bool map_next_waypoint(const WorldMap *m, double sx, double sy, double gx, doubl
             if (nx < 0 || ny < 0 || nx >= m->nav_nx || ny >= m->nav_ny) continue;
             int nidx = ny * m->nav_nx + nx;
             if (closed[nidx] || (m->nav_blocked[nidx] && nidx != gidx)) continue;
-            float ng = gscore[cur.idx] + dc[k];
+            float dz = m->nav_z ? (m->nav_z[nidx] - m->nav_z[cur.idx]) : 0.0f;
+            float climb_cost = (dz > 1.2f) ? dz * 0.4f : 0.0f;
+            float ng = gscore[cur.idx] + dc[k] + climb_cost;
             if (ng < gscore[nidx]) {
                 gscore[nidx] = ng;
                 parent[nidx] = cur.idx;
