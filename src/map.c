@@ -101,12 +101,32 @@ bool map_load(WorldMap *m, const char *map_dir) {
     }
 
     m->loaded = true;
+
+    // Build 4m navigation grid
+    m->nav_step = 4.0;
+    m->nav_nx = (int)(m->nx * m->step / m->nav_step);
+    m->nav_ny = (int)(m->ny * m->step / m->nav_step);
+    if (m->nav_nx > 0 && m->nav_ny > 0) {
+        m->nav_blocked = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
+        for (int iy = 0; iy < m->nav_ny; iy++) {
+            double y = m->min_y + (iy + 0.5) * m->nav_step;
+            for (int ix = 0; ix < m->nav_nx; ix++) {
+                double x = m->min_x + (ix + 0.5) * m->nav_step;
+                double z = map_terrain_height(m, x, y);
+                if (map_blocked_at(m, x, y, z + 1.2, 7.5)) {
+                    m->nav_blocked[iy * m->nav_nx + ix] = 1;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
 void map_free(WorldMap *m) {
     if (!m) return;
     free(m->terrain);
+    free(m->nav_blocked);
     for (int i = 0; i < m->n_prisms; i++) {
         free(m->prisms[i].ring.pts);
         for (int h = 0; h < m->prisms[i].n_holes; h++) {
@@ -216,5 +236,124 @@ bool map_los_clear(const WorldMap *m, double ax, double ay, double az, double bx
             }
         }
     }
+    return true;
+}
+
+typedef struct {
+    int idx;
+    float f;
+} AStarNode;
+
+bool map_next_waypoint(const WorldMap *m, double sx, double sy, double gx, double gy, double *wx, double *wy) {
+    if (!m || !m->loaded || !m->nav_blocked) {
+        *wx = gx; *wy = gy;
+        return false;
+    }
+    int six = (int)((sx - m->min_x) / m->nav_step);
+    int siy = (int)((sy - m->min_y) / m->nav_step);
+    int gix = (int)((gx - m->min_x) / m->nav_step);
+    int giy = (int)((gy - m->min_y) / m->nav_step);
+    if (six < 0) six = 0;
+    if (siy < 0) siy = 0;
+    if (six >= m->nav_nx) six = m->nav_nx - 1;
+    if (siy >= m->nav_ny) siy = m->nav_ny - 1;
+    if (gix < 0) gix = 0;
+    if (giy < 0) giy = 0;
+    if (gix >= m->nav_nx) gix = m->nav_nx - 1;
+    if (giy >= m->nav_ny) giy = m->nav_ny - 1;
+
+    if (six == gix && siy == giy) {
+        *wx = gx; *wy = gy;
+        return true;
+    }
+
+    int total = m->nav_nx * m->nav_ny;
+    float *gscore = (float *)malloc((size_t)total * sizeof(float));
+    int *parent = (int *)malloc((size_t)total * sizeof(int));
+    uint8_t *closed = (uint8_t *)calloc((size_t)total, 1);
+    AStarNode *heap = (AStarNode *)malloc(2048 * sizeof(AStarNode));
+    if (!gscore || !parent || !closed || !heap) {
+        free(gscore); free(parent); free(closed); free(heap);
+        *wx = gx; *wy = gy;
+        return false;
+    }
+    for (int i = 0; i < total; i++) { gscore[i] = 1e9f; parent[i] = -1; }
+
+    int sidx = siy * m->nav_nx + six;
+    int gidx = giy * m->nav_nx + gix;
+    gscore[sidx] = 0.0f;
+    int hsz = 0;
+    heap[hsz++] = (AStarNode){ sidx, (float)hypot(gix - six, giy - siy) };
+
+    int best_idx = sidx;
+    float best_h = (float)hypot(gix - six, giy - siy);
+    int expansions = 0;
+
+    static const int dx[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
+    static const int dy[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
+    static const float dc[8] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.414f, 1.414f, 1.414f, 1.414f };
+
+    while (hsz > 0 && expansions < 1500) {
+        AStarNode cur = heap[0];
+        heap[0] = heap[--hsz];
+        int p = 0;
+        while (1) {
+            int l = 2 * p + 1, r = 2 * p + 2, sm = p;
+            if (l < hsz && heap[l].f < heap[sm].f) sm = l;
+            if (r < hsz && heap[r].f < heap[sm].f) sm = r;
+            if (sm == p) break;
+            AStarNode tmp = heap[p]; heap[p] = heap[sm]; heap[sm] = tmp;
+            p = sm;
+        }
+
+        if (closed[cur.idx]) continue;
+        closed[cur.idx] = 1;
+        expansions++;
+
+        if (cur.idx == gidx) { best_idx = gidx; break; }
+
+        int cx = cur.idx % m->nav_nx;
+        int cy = cur.idx / m->nav_nx;
+        float h = (float)hypot(gix - cx, giy - cy);
+        if (h < best_h) { best_h = h; best_idx = cur.idx; }
+
+        for (int k = 0; k < 8; k++) {
+            int nx = cx + dx[k], ny = cy + dy[k];
+            if (nx < 0 || ny < 0 || nx >= m->nav_nx || ny >= m->nav_ny) continue;
+            int nidx = ny * m->nav_nx + nx;
+            if (closed[nidx] || (m->nav_blocked[nidx] && nidx != gidx)) continue;
+            float ng = gscore[cur.idx] + dc[k];
+            if (ng < gscore[nidx]) {
+                gscore[nidx] = ng;
+                parent[nidx] = cur.idx;
+                float nf = ng + (float)hypot(gix - nx, giy - ny);
+                if (hsz < 2048) {
+                    int c = hsz++;
+                    heap[c] = (AStarNode){ nidx, nf };
+                    while (c > 0) {
+                        int par = (c - 1) / 2;
+                        if (heap[par].f <= heap[c].f) break;
+                        AStarNode tmp = heap[par]; heap[par] = heap[c]; heap[c] = tmp;
+                        c = par;
+                    }
+                }
+            }
+        }
+    }
+
+    // Walk back from best_idx to find the 2nd or 3rd step from start
+    int cur = best_idx;
+    int prev = cur;
+    int prev2 = cur;
+    while (cur != -1 && cur != sidx) {
+        prev2 = prev;
+        prev = cur;
+        cur = parent[cur];
+    }
+    int target_cell = (prev2 != sidx) ? prev2 : prev;
+    *wx = m->min_x + (target_cell % m->nav_nx + 0.5) * m->nav_step;
+    *wy = m->min_y + (target_cell / m->nav_nx + 0.5) * m->nav_step;
+
+    free(gscore); free(parent); free(closed); free(heap);
     return true;
 }
