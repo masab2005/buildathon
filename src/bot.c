@@ -33,7 +33,11 @@ void bot_init(BotState *b, const JsonValue *hello) {
     b->slot = json_int(json_get(hello, "slot"), 0);
     b->rng = (uint64_t)json_num(json_get(hello, "seed"), 12345.0);
     if (b->rng == 0) b->rng = 123456789ULL;
+    b->stance = STANCE_BRAWL;
+    b->prev_alive = 16;
     b->last_damage_t = -100.0;
+    b->last_los_t = -100.0;
+    b->kite_until = -100.0;
 
     const JsonValue *map_obj = json_get(hello, "map");
     const char *map_dir = json_str(json_get(map_obj, "dir"), "/arena");
@@ -50,9 +54,10 @@ static int pick_upgrade(const JsonValue *offer) {
     if (n == 0) return -1;
 
     static const char *prio[] = {
-        "armor", "max_hp", "hp", "regen",
+        "armor", "max_hp", "hp", "regen", "nanites", "plating",
+        "servo", "jet", "speed", "boost",
         "gun_rate", "gun_dmg", "laser_dmg", "laser_charge",
-        "mortar_dmg", "lightning_dmg", "speed", "boost", "sensors"
+        "mortar_dmg", "lightning_dmg", "sensors"
     };
     int best_idx = 0;
     int best_score = 999;
@@ -86,6 +91,7 @@ static bool solve_mortar_pitch(double horiz_dist, double dz, double v, double g,
 void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) {
     int tick = json_int(json_get(obs, "tick"), 0);
     double t = json_num(json_get(obs, "t"), 0.0);
+    int alive = json_int(json_get(obs, "alive"), 16);
 
     const JsonValue *self = json_get(obs, "self");
     const JsonValue *pos_arr = json_get(self, "pos");
@@ -109,16 +115,19 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     // Weapons
     const JsonValue *weapons = json_get(self, "weapons");
     const char *w_kind[2] = { NULL, NULL };
+    double w_cd[2] = { 0.0, 0.0 };
     int w_ammo[2] = { 0, 0 };
     double w_reload[2] = { 0.0, 0.0 };
     double w_charge[2] = { 0.0, 0.0 };
     double w_speed[2] = { 252.0, 252.0 };
     double w_range[2] = { 230.0, 230.0 };
+    int w_mag[2] = { 12, 12 };
 
     for (int i = 0; i < 2; i++) {
         const JsonValue *w = json_arr_get(weapons, (size_t)i);
         if (w && w->type == JSON_OBJECT) {
             w_kind[i] = json_str(json_get(w, "kind"), NULL);
+            w_cd[i] = json_num(json_get(w, "cooldown"), 0.0);
             w_ammo[i] = json_int(json_get(w, "ammo"), 0);
             w_reload[i] = json_num(json_get(w, "reload"), 0.0);
             w_charge[i] = json_num(json_get(w, "charge"), 0.0);
@@ -126,25 +135,44 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             if (ws) {
                 w_speed[i] = json_num(json_get(ws, "speed"), 252.0);
                 w_range[i] = json_num(json_get(ws, "range"), 230.0);
+                w_mag[i] = json_int(json_get(ws, "mag"), 12);
             }
         }
     }
 
-    // Events (track damage)
+    // Events (track damage, kills, lobby stance)
+    int kills_this_tick = 0;
     const JsonValue *events = json_get(obs, "events");
     size_t nev = json_arr_len(events);
     for (size_t i = 0; i < nev; i++) {
         const JsonValue *ev = json_arr_get(events, i);
-        if (strcmp(json_str(json_get(ev, "type"), ""), "damaged") == 0) {
+        const char *etype = json_str(json_get(ev, "type"), "");
+        if (strcmp(etype, "damaged") == 0) {
             const JsonValue *br = json_get(ev, "bearing");
             if (br && br->type == JSON_NUMBER) {
                 b->last_damage_t = t;
                 b->last_damage_bearing = br->u.number;
             }
+            int by = json_int(json_get(ev, "by"), -1);
+            if (by >= 0 && by < 16) {
+                b->threats[by].last_hit_us_t = t;
+                b->attackers_mask |= (1 << by);
+            }
+        } else if (strcmp(etype, "kill") == 0) {
+            kills_this_tick++;
+            b->our_kills++;
         }
     }
 
-    // Zone
+    // Lobby detection: if alive dropped without our kill, it's BRAWL; if 2+ attackers before our first kill, SQUAD
+    if (alive < b->prev_alive - kills_this_tick) {
+        b->stance = STANCE_BRAWL;
+    } else if (b->our_kills == 0 && __builtin_popcount((unsigned int)b->attackers_mask) >= 2 && t > 20.0) {
+        b->stance = STANCE_SQUAD;
+    }
+    b->prev_alive = alive;
+
+    // Zone timeline model
     const JsonValue *zone = json_get(obs, "zone");
     const JsonValue *zc = json_get(zone, "center");
     const JsonValue *znc = json_get(zone, "next_center");
@@ -155,6 +183,14 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     double z_ny = json_num(json_arr_get(znc, 1), z_cy);
     double z_nr = json_num(json_get(zone, "next_radius"), z_r);
     double shrink_start = json_num(json_get(zone, "shrink_start"), 999.0);
+    double shrink_end = json_num(json_get(zone, "shrink_end"), 999.0);
+
+    double d_next = dist2d(px, py, z_nx, z_ny);
+    double m_out_next = fmax(0.0, d_next - z_nr * 0.92);
+    double travel_s = m_out_next / 11.7 + 2.5;
+    double time_to_edge = (t < shrink_start) ? (shrink_start - t + (shrink_end - shrink_start) * 0.3) : fmax(0.0, shrink_end - t);
+    bool zone_critical = !in_zone || (dist2d(px, py, z_cx, z_cy) > z_r - 8.0) || (time_to_edge < 2.5 && m_out_next > 0.0);
+    bool zone_urgent = zone_critical || (m_out_next > 0.0 && (time_to_edge - travel_s < 9.0));
 
     // Upgrade offer
     int pick_idx = -1;
@@ -163,104 +199,148 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         pick_idx = pick_upgrade(offer);
     }
 
-    // Analyze visible mechs & NPCs
+    // Update threat table from visible mechs
     const JsonValue *mechs = json_get(obs, "mechs");
     size_t nm = json_arr_len(mechs);
-    int nearby_enemies = 0;
-    bool enemy_charging = false;
 
-    bool has_target = false;
-    bool target_is_mech = false;
-    double tgt_x = 0, tgt_y = 0, tgt_z = 0, tgt_vx = 0, tgt_vy = 0, tgt_vz = 0;
-    double best_score = 1e9;
+    bool has_npc = false;
+    double npc_x = 0, npc_y = 0, npc_z = 0, npc_vx = 0, npc_vy = 0, npc_vz = 0;
+    double best_npc_d = 90.0;
 
     for (size_t i = 0; i < nm; i++) {
         const JsonValue *m = json_arr_get(mechs, i);
         const char *kind = json_str(json_get(m, "kind"), "");
-        bool is_mech = (strcmp(kind, "mech") == 0);
         const JsonValue *mp = json_get(m, "pos");
         const JsonValue *mv = json_get(m, "vel");
         double mx = json_num(json_arr_get(mp, 0), 0.0);
         double my = json_num(json_arr_get(mp, 1), 0.0);
         double mz = json_num(json_arr_get(mp, 2), 0.0);
-        double d = dist2d(px, py, mx, my);
+        double mvx = json_num(json_arr_get(mv, 0), 0.0);
+        double mvy = json_num(json_arr_get(mv, 1), 0.0);
+        double mvz = json_num(json_arr_get(mv, 2), 0.0);
 
-        if (is_mech) {
-            if (d < 95.0) nearby_enemies++;
-            if (json_bool(json_get(m, "charging"), false)) enemy_charging = true;
-        }
-
-        double score = d + (is_mech ? 0.0 : 120.0);
-        if (score < best_score) {
-            best_score = score;
-            has_target = true;
-            target_is_mech = is_mech;
-            tgt_x = mx; tgt_y = my; tgt_z = mz;
-            tgt_vx = json_num(json_arr_get(mv, 0), 0.0);
-            tgt_vy = json_num(json_arr_get(mv, 1), 0.0);
-            tgt_vz = json_num(json_arr_get(mv, 2), 0.0);
-        }
-    }
-
-    // Also check crates if no mech/NPC target
-    if (!has_target) {
-        const JsonValue *crates = json_get(obs, "crates");
-        size_t nc = json_arr_len(crates);
-        double best_cd = 60.0;
-        for (size_t i = 0; i < nc; i++) {
-            const JsonValue *c = json_arr_get(crates, i);
-            const JsonValue *cp = json_get(c, "pos");
-            double cx = json_num(json_arr_get(cp, 0), 0.0);
-            double cy = json_num(json_arr_get(cp, 1), 0.0);
-            double cz = json_num(json_arr_get(cp, 2), 0.0);
-            double d = dist2d(px, py, cx, cy);
-            if (d < best_cd && map_los_clear(&b->map, px, py, pz + muzzle_h, cx, cy, cz + 1.5)) {
-                best_cd = d;
-                has_target = true;
-                target_is_mech = false;
-                tgt_x = cx; tgt_y = cy; tgt_z = cz - 3.0;
-                tgt_vx = tgt_vy = tgt_vz = 0.0;
+        if (strcmp(kind, "mech") == 0) {
+            int id = json_int(json_get(m, "id"), -1);
+            if (id >= 0 && id < 16) {
+                ThreatMech *tm = &b->threats[id];
+                if (tm->active && t - tm->pred_t > 0.15 && t - tm->pred_t < 0.6) {
+                    double es = dist2d(mx, my, tm->pred_static[0], tm->pred_static[1]);
+                    double el = dist2d(mx, my, tm->pred_lead[0], tm->pred_lead[1]);
+                    tm->err_static = tm->err_static * 0.7 + es * 0.3;
+                    tm->err_lead = tm->err_lead * 0.7 + el * 0.3;
+                }
+                tm->active = true;
+                tm->pos[0] = mx; tm->pos[1] = my; tm->pos[2] = mz;
+                tm->vel[0] = mvx; tm->vel[1] = mvy; tm->vel[2] = mvz;
+                const JsonValue *ma = json_get(m, "aim");
+                tm->aim[0] = json_num(json_arr_get(ma, 0), 0.0);
+                tm->aim[1] = json_num(json_arr_get(ma, 1), 0.0);
+                tm->hp = json_num(json_get(m, "hp"), 1400.0);
+                tm->max_hp = json_num(json_get(m, "max_hp"), 1400.0);
+                tm->last_seen_t = t;
+                tm->charging = json_bool(json_get(m, "charging"), false);
+                tm->has_mortar = tm->has_laser = tm->has_lightning = false;
+                const JsonValue *mw = json_get(m, "weapons");
+                for (size_t k = 0; k < json_arr_len(mw); k++) {
+                    const char *wk = json_str(json_arr_get(mw, k), "");
+                    if (strcmp(wk, "mortar") == 0) tm->has_mortar = true;
+                    if (strcmp(wk, "laser") == 0) tm->has_laser = true;
+                    if (strcmp(wk, "lightning") == 0) tm->has_lightning = true;
+                }
+            }
+        } else if (strcmp(kind, "npc") == 0) {
+            double d = dist2d(px, py, mx, my);
+            if (d < best_npc_d) {
+                best_npc_d = d;
+                has_npc = true;
+                npc_x = mx; npc_y = my; npc_z = mz;
+                npc_vx = mvx; npc_vy = mvy; npc_vz = mvz;
             }
         }
     }
 
-    // Movement decision
-    double move_x = 0.0, move_y = 0.0;
+    // Evaluate active threats (5s memory)
+    int engaged_count = 0;
+    bool enemy_charging = false;
+    int best_threat_id = -1;
+    double best_threat_score = 1e9;
+    bool any_los = false;
+
+    for (int id = 0; id < 16; id++) {
+        ThreatMech *tm = &b->threats[id];
+        if (!tm->active || t - tm->last_seen_t > 5.0) {
+            tm->active = false;
+            continue;
+        }
+        double d = dist2d(px, py, tm->pos[0], tm->pos[1]);
+        double to_us = atan2(py - tm->pos[1], px - tm->pos[0]);
+        bool aiming_at_us = fabs(wrap_angle(tm->aim[0] - to_us)) < 0.45;
+        bool engaged = aiming_at_us || (t - tm->last_hit_us_t < 3.0);
+        if (engaged && d < 120.0) engaged_count++;
+        if (tm->charging && d < 220.0) enemy_charging = true;
+
+        bool los = map_los_clear(&b->map, px, py, pz + muzzle_h, tm->pos[0], tm->pos[1], tm->pos[2] + 4.5);
+        if (los) any_los = true;
+
+        double score = d + (los ? 0.0 : 80.0) - (engaged ? 20.0 : 0.0);
+        if (score < best_threat_score) {
+            best_threat_score = score;
+            best_threat_id = id;
+        }
+    }
+    if (any_los) b->last_los_t = t;
+
+    // Trigger 6s kite when focus-fired or low HP
+    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.52 : 0.42;
+    if (!zone_critical && (engaged_count >= 2 || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
+        if (t > b->kite_until) {
+            b->kite_until = t + 6.0;
+            if (best_threat_id >= 0) {
+                double dx = px - b->threats[best_threat_id].pos[0];
+                double dy = py - b->threats[best_threat_id].pos[1];
+                double dl = hypot(dx, dy) + 1e-6;
+                b->kite_dir[0] = dx / dl;
+                b->kite_dir[1] = dy / dl;
+            } else {
+                b->kite_dir[0] = -cos(b->last_damage_bearing);
+                b->kite_dir[1] = -sin(b->last_damage_bearing);
+            }
+        }
+    }
+
+    // Choose desired movement goal
+    double goal_vx = 0.0, goal_vy = 0.0;
     bool boost = false;
     bool jump = false;
 
-    double d_next = dist2d(px, py, z_nx, z_ny);
-    bool need_zone = !in_zone || (t > shrink_start - 15.0 && d_next > z_nr - 20.0) || (dist2d(px, py, z_cx, z_cy) > z_r - 15.0);
-
-    if (need_zone) {
+    if (zone_urgent) {
         double ang = atan2(z_ny - py, z_nx - px);
-        move_x = cos(ang);
-        move_y = sin(ang);
-        if (!in_zone && energy > 30.0) boost = true;
-    } else if (has_target && target_is_mech && (hp < max_hp * 0.45 || nearby_enemies >= 2)) {
-        // Disengage / kite away toward zone center
-        double away_x = px - tgt_x;
-        double away_y = py - tgt_y;
-        double alen = hypot(away_x, away_y) + 1e-6;
+        double gx = z_nx - 0.6 * z_nr * cos(ang);
+        double gy = z_ny - 0.6 * z_nr * sin(ang);
+        double d = dist2d(px, py, gx, gy) + 1e-6;
+        goal_vx = (gx - px) / d;
+        goal_vy = (gy - py) / d;
+        if (zone_critical && energy > 25.0) boost = true;
+    } else if (t < b->kite_until) {
         double zx = z_nx - px, zy = z_ny - py;
-        double zlen = hypot(zx, zy) + 1e-6;
-        move_x = 0.7 * (away_x / alen) + 0.3 * (zx / zlen);
-        move_y = 0.7 * (away_y / alen) + 0.3 * (zy / zlen);
-        if (energy > 40.0) boost = true;
-    } else if (has_target && target_is_mech) {
-        // Strafe perpendicular to target
-        double dx = tgt_x - px, dy = tgt_y - py;
+        double zl = hypot(zx, zy) + 1e-6;
+        goal_vx = 0.75 * b->kite_dir[0] + 0.25 * (zx / zl);
+        goal_vy = 0.75 * b->kite_dir[1] + 0.25 * (zy / zl);
+        if (energy > 35.0) boost = true;
+    } else if (best_threat_id >= 0) {
+        ThreatMech *tm = &b->threats[best_threat_id];
+        double dx = tm->pos[0] - px, dy = tm->pos[1] - py;
         double d = hypot(dx, dy) + 1e-6;
         double dir = ((tick / 25) % 2 == 0) ? 1.0 : -1.0;
-        double sx = -dy / d * dir;
-        double sy = dx / d * dir;
-        double radial = (d > 55.0) ? 0.35 : (d < 22.0 ? -0.45 : 0.0);
-        move_x = sx + radial * (dx / d);
-        move_y = sy + radial * (dy / d);
+        double sx = -dy / d * dir, sy = dx / d * dir;
+        double desired_d = (w_kind[1] && strcmp(w_kind[1], "lightning") == 0) ? 35.0 : 65.0;
+        double radial = (d > desired_d + 12.0) ? 0.4 : (d < desired_d - 12.0 ? -0.45 : 0.0);
+        goal_vx = sx + radial * (dx / d);
+        goal_vy = sy + radial * (dy / d);
         if (enemy_charging && energy > 25.0) boost = true;
     } else {
-        // Look for nearby cubes or pickups
-        double best_loot_d = 45.0;
+        // Safe economy: cubes or pickups nearby, else patrol toward 0.6 * next_radius
+        double best_loot_d = (b->stance == STANCE_SQUAD) ? 35.0 : 50.0;
         bool found_loot = false;
         const JsonValue *cubes = json_get(obs, "cubes");
         for (size_t i = 0; i < json_arr_len(cubes); i++) {
@@ -271,8 +351,8 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             if (d < best_loot_d) {
                 best_loot_d = d;
                 found_loot = true;
-                move_x = (cx - px) / (d + 1e-6);
-                move_y = (cy - py) / (d + 1e-6);
+                goal_vx = (cx - px) / (d + 1e-6);
+                goal_vy = (cy - py) / (d + 1e-6);
             }
         }
         if (!found_loot && w_kind[1] == NULL) {
@@ -285,51 +365,58 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
                 if (d < best_loot_d) {
                     best_loot_d = d;
                     found_loot = true;
-                    move_x = (cx - px) / (d + 1e-6);
-                    move_y = (cy - py) / (d + 1e-6);
+                    goal_vx = (cx - px) / (d + 1e-6);
+                    goal_vy = (cy - py) / (d + 1e-6);
                 }
             }
         }
-        if (!found_loot) {
-            // Patrol toward next zone center
-            double d = dist2d(px, py, z_nx, z_ny);
-            if (d > 25.0) {
-                move_x = (z_nx - px) / d;
-                move_y = (z_ny - py) / d;
-            }
+        if (!found_loot && d_next > z_nr * 0.6) {
+            goal_vx = (z_nx - px) / (d_next + 1e-6);
+            goal_vy = (z_ny - py) / (d_next + 1e-6);
         }
     }
 
-    // Normalize move
-    double mlen = hypot(move_x, move_y);
-    if (mlen > 1e-6) {
-        move_x /= mlen;
-        move_y /= mlen;
-
-        // Obstacle avoidance using map
-        if (map_blocked_at(&b->map, px + move_x * 4.5, py + move_y * 4.5, pz, 8.5)) {
-            double base_ang = atan2(move_y, move_x);
-            double offsets[] = { 0.785, -0.785, 1.57, -1.57 };
-            bool steered = false;
-            for (int k = 0; k < 4; k++) {
-                double a = base_ang + offsets[k];
-                double tx = cos(a), ty = sin(a);
-                if (!map_blocked_at(&b->map, px + tx * 4.5, py + ty * 4.5, pz, 8.5)) {
-                    move_x = tx;
-                    move_y = ty;
-                    steered = true;
-                    break;
-                }
+    // Local 8-heading steering with obstacle & projectile avoidance
+    double move_x = 0.0, move_y = 0.0;
+    double glen = hypot(goal_vx, goal_vy);
+    if (glen > 1e-6) {
+        double base_ang = atan2(goal_vy, goal_vx);
+        const JsonValue *projs = json_get(obs, "projectiles");
+        size_t nproj = json_arr_len(projs);
+        double best_h_score = -1e9;
+        for (int k = 0; k < 8; k++) {
+            double ang = base_ang + k * (M_PI / 4.0);
+            double hx = cos(ang), hy = sin(ang);
+            double score = cos(ang - base_ang) * 10.0;
+            if (map_blocked_at(&b->map, px + hx * 4.5, py + hy * 4.5, pz, 8.5)) {
+                score -= 100.0;
             }
-            if (!steered && grounded) {
-                jump = true;
-                if (energy > 30.0) boost = true;
+            for (size_t p = 0; p < nproj; p++) {
+                const JsonValue *pr = json_arr_get(projs, p);
+                const JsonValue *pp = json_get(pr, "pos");
+                const JsonValue *pv = json_get(pr, "vel");
+                double prx = json_num(json_arr_get(pp, 0), 0.0);
+                double pry = json_num(json_arr_get(pp, 1), 0.0);
+                double pvx = json_num(json_arr_get(pv, 0), 0.0);
+                double pvy = json_num(json_arr_get(pv, 1), 0.0);
+                double nx = px + hx * 2.0, ny = py + hy * 2.0;
+                double d_proj = dist2d(nx, ny, prx + pvx * 0.1, pry + pvy * 0.1);
+                if (d_proj < 5.0) score -= (5.0 - d_proj) * 4.0;
             }
+            if (score > best_h_score) {
+                best_h_score = score;
+                move_x = hx;
+                move_y = hy;
+            }
+        }
+        if (best_h_score < -50.0 && grounded) {
+            jump = true;
+            if (energy > 30.0) boost = true;
         }
     }
 
     // Anti-stuck
-    if (mlen > 0.2 && dist3d(px, py, pz, b->last_pos[0], b->last_pos[1], b->last_pos[2]) < 0.12) {
+    if (glen > 0.2 && dist3d(px, py, pz, b->last_pos[0], b->last_pos[1], b->last_pos[2]) < 0.12) {
         b->stuck_ticks++;
         if (b->stuck_ticks > 8) {
             if (grounded) jump = true;
@@ -360,41 +447,62 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         }
     }
 
-    // Aiming & Firing
+    // Aiming & Fire Discipline
     double aim_yaw = cur_yaw;
     double aim_pitch = 0.0;
     bool fire[2] = { false, false };
     bool reload = false;
 
-    if (has_target) {
-        double d3 = dist3d(px, py, pz + muzzle_h, tgt_x, tgt_y, tgt_z + 4.5);
-        double d2 = dist2d(px, py, tgt_x, tgt_y);
-        double t_lead = d3 / 252.0;
-        double lx = tgt_x + tgt_vx * t_lead;
-        double ly = tgt_y + tgt_vy * t_lead;
-        double lz = tgt_z + 4.5 + tgt_vz * t_lead;
+    bool have_aim_target = false;
+    double tx = 0, ty = 0, tz = 0, tvx = 0, tvy = 0, tvz = 0;
+    bool use_lead = true;
+
+    if (best_threat_id >= 0) {
+        ThreatMech *tm = &b->threats[best_threat_id];
+        have_aim_target = true;
+        tx = tm->pos[0]; ty = tm->pos[1]; tz = tm->pos[2];
+        tvx = tm->vel[0]; tvy = tm->vel[1]; tvz = tm->vel[2];
+        use_lead = (tm->err_lead <= tm->err_static + 0.5);
+
+        double d3 = dist3d(px, py, pz + muzzle_h, tx, ty, tz + 4.5);
+        double tl = d3 / 252.0 + 0.07;
+        tm->pred_static[0] = tx;
+        tm->pred_static[1] = ty;
+        tm->pred_lead[0] = tx + tvx * tl;
+        tm->pred_lead[1] = ty + tvy * tl;
+        tm->pred_t = t;
+    } else if (has_npc && !zone_urgent) {
+        have_aim_target = true;
+        tx = npc_x; ty = npc_y; tz = npc_z;
+        tvx = npc_vx; tvy = npc_vy; tvz = npc_vz;
+    }
+
+    if (have_aim_target) {
+        double d3 = dist3d(px, py, pz + muzzle_h, tx, ty, tz + 4.5);
+        double d2 = dist2d(px, py, tx, ty);
+        double t_lead = use_lead ? (d3 / 252.0 + 0.07) : 0.0;
+        double lx = tx + tvx * t_lead;
+        double ly = ty + tvy * t_lead;
+        double lz = tz + 4.5 + tvz * t_lead;
 
         aim_yaw = atan2(ly - py, lx - px);
         aim_pitch = atan2(lz - (pz + muzzle_h), hypot(lx - px, ly - py));
 
         bool los = map_los_clear(&b->map, px, py, pz + muzzle_h, lx, ly, lz);
         double aim_err = fabs(wrap_angle(aim_yaw - cur_yaw));
+        double ang_size = atan2(2.8, fmax(d3, 5.0)) + 0.05;
 
         for (int s = 0; s < 2; s++) {
             if (!w_kind[s]) continue;
             if (strcmp(w_kind[s], "gun") == 0) {
-                if (los && d3 < w_range[s] && aim_err < 0.18 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
+                if (los && d3 < w_range[s] && aim_err < ang_size && w_cd[s] <= 0.0 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
                     fire[s] = true;
                 }
             } else if (strcmp(w_kind[s], "laser") == 0) {
-                if (los && d3 < w_range[s]) {
-                    if (w_charge[s] < 0.72) {
-                        fire[s] = true; // hold to charge
-                    } else if (aim_err < 0.06) {
-                        fire[s] = false; // release to fire!
-                    } else {
-                        fire[s] = true; // hold until aligned
-                    }
+                if (los && d3 < w_range[s] && t > b->kite_until) {
+                    if (w_charge[s] < 0.72) fire[s] = true;
+                    else if (aim_err < 0.06) fire[s] = false;
+                    else fire[s] = true;
                 }
             } else if (strcmp(w_kind[s], "lightning") == 0) {
                 if (los && d3 < 43.0 && aim_err < 0.45 && energy > 15.0) {
@@ -402,7 +510,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
                 }
             } else if (strcmp(w_kind[s], "mortar") == 0) {
                 double mpitch = 0.0;
-                if (d2 > 18.0 && d2 < 215.0 && solve_mortar_pitch(d2, (tgt_z + 2.0) - (pz + 9.5), w_speed[s], 22.0, &mpitch)) {
+                if (d2 > 18.0 && d2 < 215.0 && solve_mortar_pitch(d2, (tz + 2.0) - (pz + 9.5), w_speed[s], 22.0, &mpitch)) {
                     aim_pitch = mpitch;
                     if (aim_err < 0.15 && fabs(mpitch - cur_pitch) < 0.15) {
                         fire[s] = true;
@@ -419,7 +527,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         aim_pitch = 0.0;
     }
 
-    if (!has_target && w_kind[0] && strcmp(w_kind[0], "gun") == 0 && w_ammo[0] < 5 && w_reload[0] <= 0.0) {
+    if ((t - b->last_los_t > 1.0) && w_kind[0] && strcmp(w_kind[0], "gun") == 0 && w_ammo[0] < w_mag[0] && w_reload[0] <= 0.0) {
         reload = true;
     }
 
