@@ -298,9 +298,9 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     if (best_threat_id >= 0) b->committed_target_id = best_threat_id;
     if (any_los) b->last_los_t = t;
 
-    // Trigger retreat only when critically low or heavily focus-fired (never suppress kills for "bad_trade")
-    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.38 : 0.32;
-    if (!zone_critical && ((engaged_count >= 3 && hp < max_hp * 0.55) || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
+    // Trigger retreat when focus-fired at < 55% HP or critically low
+    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.45 : 0.36;
+    if (!zone_critical && ((engaged_count >= 2 && hp < max_hp * 0.55) || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
         if (t > b->kite_until) {
             b->kite_until = t + 6.0;
             // Find a walkable cell that breaks LOS to all active threats
@@ -348,6 +348,30 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     bool boost = false;
     bool jump = false;
 
+    // Check for uncontested supply drop
+    bool going_for_drop = false;
+    double drop_x = 0.0, drop_y = 0.0;
+    const JsonValue *drops = json_get(obs, "drops");
+    for (size_t i = 0; i < json_arr_len(drops); i++) {
+        const JsonValue *dr = json_arr_get(drops, i);
+        double lands_in = json_num(json_get(dr, "lands_in"), 999.0);
+        const JsonValue *dp = json_get(dr, "pos");
+        double dx = json_num(json_arr_get(dp, 0), 0.0);
+        double dy = json_num(json_arr_get(dp, 1), 0.0);
+        double d_drop = dist2d(px, py, dx, dy);
+        const JsonValue *holder = json_get(dr, "holder");
+        bool free_or_ours = (!holder || holder->type == JSON_NULL || json_int(holder, -1) == b->slot);
+        if (lands_in <= 12.0 && free_or_ours && d_drop < 120.0 && dist2d(dx, dy, z_nx, z_ny) < z_nr * 0.92) {
+            if (best_threat_id < 0 || dist2d(px, py, b->threats[best_threat_id].pos[0], b->threats[best_threat_id].pos[1]) > 50.0) {
+                going_for_drop = true;
+                drop_x = dx; drop_y = dy;
+                break;
+            }
+        }
+    }
+
+    bool reloading_or_charging = (w_reload[0] > 0.0) || (w_kind[1] && strcmp(w_kind[1], "laser") == 0 && w_charge[1] > 0.0 && w_charge[1] < 0.65);
+
     if (zone_urgent) {
         double ang = atan2(z_ny - py, z_nx - px);
         double gx = z_nx - 0.6 * z_nr * cos(ang);
@@ -366,6 +390,32 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         goal_vx = 0.75 * b->kite_dir[0] + 0.25 * (zx / zl);
         goal_vy = 0.75 * b->kite_dir[1] + 0.25 * (zy / zl);
         if (energy > 35.0) boost = true;
+    } else if (going_for_drop) {
+        if (tick - b->cached_wp_tick >= 5) {
+            map_next_waypoint(&b->map, px, py, drop_x, drop_y, &b->cached_wp[0], &b->cached_wp[1]);
+            b->cached_wp_tick = tick;
+        }
+        double d = dist2d(px, py, b->cached_wp[0], b->cached_wp[1]) + 1e-6;
+        goal_vx = (b->cached_wp[0] - px) / d;
+        goal_vy = (b->cached_wp[1] - py) / d;
+    } else if (best_threat_id >= 0 && reloading_or_charging) {
+        // Peek-and-cover: duck behind cover while reloading gun or charging laser
+        ThreatMech *tm = &b->threats[best_threat_id];
+        double best_c_score = -1e9;
+        double cx_best = px, cy_best = py;
+        for (int k = 0; k < 8; k++) {
+            double ang = k * (M_PI / 4.0);
+            double cx = px + 14.0 * cos(ang), cy = py + 14.0 * sin(ang);
+            if (dist2d(cx, cy, z_nx, z_ny) > z_nr * 0.95) continue;
+            double cz = map_terrain_height(&b->map, cx, cy);
+            if (map_blocked_at(&b->map, cx, cy, cz + 1.2, 7.5)) continue;
+            bool vis = map_los_clear(&b->map, cx, cy, cz + 6.0, tm->pos[0], tm->pos[1], tm->pos[2] + 6.0);
+            double sc = vis ? -50.0 : 50.0;
+            if (sc > best_c_score) { best_c_score = sc; cx_best = cx; cy_best = cy; }
+        }
+        double d = dist2d(px, py, cx_best, cy_best) + 1e-6;
+        goal_vx = (cx_best - px) / d;
+        goal_vy = (cy_best - py) / d;
     } else if (best_threat_id >= 0) {
         ThreatMech *tm = &b->threats[best_threat_id];
         double dx = tm->pos[0] - px, dy = tm->pos[1] - py;
