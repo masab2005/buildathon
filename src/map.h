@@ -33,6 +33,8 @@ typedef struct {
     double nav_step;
     uint8_t *nav_blocked;
     uint8_t *nav_cover;
+    uint16_t *nav_vis;
+    float *nav_z;
 } WorldMap;
 
 bool map_load(WorldMap *m, const char *map_dir);
