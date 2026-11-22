@@ -268,7 +268,6 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     int best_threat_id = -1;
     double best_threat_score = 1e9;
     bool any_los = false;
-    double enemy_dps_on_us = 0.0;
 
     for (int id = 0; id < 16; id++) {
         ThreatMech *tm = &b->threats[id];
@@ -285,7 +284,6 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         if (los) any_los = true;
         if (engaged && d < 120.0) {
             engaged_count++;
-            if (los) enemy_dps_on_us += (d < 45.0 && tm->has_lightning) ? 220.0 : 160.0;
         }
         if (tm->charging && d < 220.0) enemy_charging = true;
 
@@ -300,17 +298,9 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
     if (best_threat_id >= 0) b->committed_target_id = best_threat_id;
     if (any_los) b->last_los_t = t;
 
-    double our_eff_dps = 185.0;
-    if (w_kind[1] && strcmp(w_kind[1], "lightning") == 0 && best_threat_id >= 0 &&
-        dist2d(px, py, b->threats[best_threat_id].pos[0], b->threats[best_threat_id].pos[1]) < 45.0) {
-        our_eff_dps += 180.0;
-    }
-    bool target_low = (best_threat_id >= 0 && b->threats[best_threat_id].hp < b->threats[best_threat_id].max_hp * 0.30);
-    bool bad_trade = (enemy_dps_on_us > 0.0 && our_eff_dps < enemy_dps_on_us * 1.15 && !target_low);
-
-    // Trigger LOS-breaking retreat + heal cycle when focus-fired, bad trade, or low HP
-    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.55 : 0.45;
-    if (!zone_critical && (engaged_count >= 2 || bad_trade || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
+    // Trigger retreat only when critically low or heavily focus-fired (never suppress kills for "bad_trade")
+    double kite_hp_thresh = (b->stance == STANCE_SQUAD) ? 0.38 : 0.32;
+    if (!zone_critical && ((engaged_count >= 3 && hp < max_hp * 0.55) || (best_threat_id >= 0 && hp < max_hp * kite_hp_thresh))) {
         if (t > b->kite_until) {
             b->kite_until = t + 6.0;
             // Find a walkable cell that breaks LOS to all active threats
@@ -496,7 +486,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             double cz = json_num(json_arr_get(pp, 2), 0.0);
             if (dist2d(px, py, cx, cy) < 3.8 && fabs(pz - cz) < 3.8) {
                 const char *pk_kind = json_str(json_get(pk, "kind"), "");
-                if (strcmp(pk_kind, "mortar") != 0 && (!w_kind[0] || strcmp(pk_kind, w_kind[0]) != 0)) {
+                if (!w_kind[0] || strcmp(pk_kind, w_kind[0]) != 0) {
                     take_id = json_int(json_get(pk, "id"), -1);
                     break;
                 }
@@ -548,15 +538,18 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
         bool los = map_los_clear(&b->map, px, py, pz + muzzle_h, lx, ly, lz);
         double aim_err = fabs(wrap_angle(aim_yaw - cur_yaw));
         double ang_size = atan2(2.8, fmax(d3, 5.0)) + 0.05;
+        bool target_low = (best_threat_id >= 0 && b->threats[best_threat_id].hp < b->threats[best_threat_id].max_hp * 0.35);
 
         for (int s = 0; s < 2; s++) {
             if (!w_kind[s]) continue;
             if (strcmp(w_kind[s], "gun") == 0) {
-                if (los && d3 < w_range[s] && aim_err < ang_size && w_cd[s] <= 0.0 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
+                // Kill-window discipline: don't poke > 150m with gun alone unless target is low
+                double max_gun_d = (w_kind[1] != NULL || target_low) ? w_range[s] : 150.0;
+                if (los && d3 < max_gun_d && aim_err < ang_size && w_cd[s] <= 0.0 && w_ammo[s] > 0 && w_reload[s] <= 0.0) {
                     fire[s] = true;
                 }
             } else if (strcmp(w_kind[s], "laser") == 0) {
-                if (los && d3 < w_range[s] && t > b->kite_until) {
+                if (los && d3 < w_range[s]) {
                     if (w_charge[s] < 0.72) fire[s] = true;
                     else if (aim_err < 0.06) fire[s] = false;
                     else fire[s] = true;
@@ -568,8 +561,7 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             } else if (strcmp(w_kind[s], "mortar") == 0) {
                 double mpitch = 0.0;
                 if (!fire[0] && d2 > 18.0 && d2 < 215.0 && solve_mortar_pitch(d2, (tz + 2.0) - (pz + 9.5), w_speed[s], 22.0, &mpitch)) {
-                    aim_pitch = mpitch;
-                    if (aim_err < 0.15 && fabs(mpitch - cur_pitch) < 0.15) {
+                    if (aim_err < 0.15 && fabs(mpitch - cur_pitch) < 0.25) {
                         fire[s] = true;
                     }
                 }
