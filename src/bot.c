@@ -433,6 +433,14 @@ void bot_step(BotState *b, const JsonValue *obs, char *out_buf, size_t out_cap) 
             if (map_blocked_at(&b->map, px + hx * 4.5, py + hy * 4.5, pz, 8.5)) {
                 score -= 100.0;
             }
+            // Penalize exposure to active threats (hug cover)
+            double cx = px + hx * 4.0, cy = py + hy * 4.0;
+            for (int id = 0; id < 16; id++) {
+                if (!b->threats[id].active) continue;
+                if (map_los_clear(&b->map, cx, cy, pz + 6.0, b->threats[id].pos[0], b->threats[id].pos[1], b->threats[id].pos[2] + 6.0)) {
+                    score -= (t < b->kite_until) ? 12.0 : 3.5;
+                }
+            }
             for (size_t p = 0; p < nproj; p++) {
                 const JsonValue *pr = json_arr_get(projs, p);
                 const JsonValue *pp = json_get(pr, "pos");
