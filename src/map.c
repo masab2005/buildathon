@@ -109,6 +109,7 @@ bool map_load(WorldMap *m, const char *map_dir) {
     if (m->nav_nx > 0 && m->nav_ny > 0) {
         m->nav_blocked = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
         m->nav_cover = (uint8_t *)calloc((size_t)(m->nav_nx * m->nav_ny), 1);
+        m->nav_vis = (uint16_t *)calloc((size_t)(m->nav_nx * m->nav_ny), sizeof(uint16_t));
         m->nav_z = (float *)calloc((size_t)(m->nav_nx * m->nav_ny), sizeof(float));
         for (int iy = 0; iy < m->nav_ny; iy++) {
             double y = m->min_y + (iy + 0.5) * m->nav_step;
@@ -144,6 +145,18 @@ bool map_load(WorldMap *m, const char *map_dir) {
                     }
                 }
                 m->nav_cover[idx] = cov;
+                // Precompute 16-sector O(1) visibility bitmask (1 = exposed, 0 = hidden)
+                uint16_t vmask = 0;
+                double x = m->min_x + (ix + 0.5) * m->nav_step;
+                double y = m->min_y + (iy + 0.5) * m->nav_step;
+                double z = m->nav_z[idx] + 6.0;
+                for (int s = 0; s < 16; s++) {
+                    double ang = -M_PI + (s + 0.5) * (2.0 * M_PI / 16.0);
+                    if (map_los_clear(m, x, y, z, x + 55.0 * cos(ang), y + 55.0 * sin(ang), z)) {
+                        vmask |= (uint16_t)(1U << s);
+                    }
+                }
+                m->nav_vis[idx] = vmask;
             }
         }
     }
@@ -156,6 +169,7 @@ void map_free(WorldMap *m) {
     free(m->terrain);
     free(m->nav_blocked);
     free(m->nav_cover);
+    free(m->nav_vis);
     free(m->nav_z);
     for (int i = 0; i < m->n_prisms; i++) {
         free(m->prisms[i].ring.pts);

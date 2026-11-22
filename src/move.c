@@ -178,9 +178,15 @@ void move_decide(
                 }
             }
             double cx = px + hx * 4.0, cy = py + hy * 4.0;
+            int vix = (int)((cx - b->map.min_x) / b->map.nav_step);
+            int viy = (int)((cy - b->map.min_y) / b->map.nav_step);
+            uint16_t vmask = (b->map.nav_vis && vix >= 0 && viy >= 0 && vix < b->map.nav_nx && viy < b->map.nav_ny)
+                ? b->map.nav_vis[viy * b->map.nav_nx + vix] : 0xFFFF;
             for (int id = 0; id < 16; id++) {
                 if (!b->threats[id].active) continue;
-                if (map_los_clear(&b->map, cx, cy, pz + 6.0, b->threats[id].pos[0], b->threats[id].pos[1], b->threats[id].pos[2] + 6.0)) {
+                double ang_t = atan2(b->threats[id].pos[1] - cy, b->threats[id].pos[0] - cx);
+                int sec = ((int)floor((ang_t + M_PI) / (2.0 * M_PI / 16.0))) & 15;
+                if (vmask & (1U << sec)) {
                     score -= (t < b->kite_until) ? 12.0 : 3.5;
                 }
             }
