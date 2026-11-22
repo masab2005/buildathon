@@ -1,0 +1,4 @@
+*.o
+bot
+/tmp/
+.DS_Store
